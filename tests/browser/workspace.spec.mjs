@@ -40,3 +40,76 @@ test('sandbox bridge uses the pinned protocol and sends navigation without priva
   await expect.poll(() => page.evaluate(() => window.messages.filter(message => message.type === 'navigate'))).toEqual([{protocol: 'freedom.guild-launchpad/v1', type: 'navigate', channel: 'b5be8af2-2e86-4208-b488-c7c9f1b84512', guildKey: workspace.guild_key, action: 'work'}]);
   expect(new URL(page.url()).pathname).toBe('/__guild-fixture');
 });
+
+test('sandbox bridge rejects messages from untrusted origins', async ({page}) => {
+  const siteUrl = `https://freetwai.github.io/${workspace.repository.split('/')[1]}/`;
+  await page.route('https://attacker.com/__guild-fixture', route => route.fulfill({contentType: 'text/html', body: '<!doctype html><html><body><main></main></body></html>'}));
+  await page.route(`${siteUrl}**`, async route => {
+    const file = route.request().url().slice(siteUrl.length) || 'index.html';
+    const types = {'index.html': 'text/html', 'site.js': 'text/javascript', 'style.css': 'text/css', 'brand.png': 'image/png'};
+    if (!Object.hasOwn(types, file)) return route.abort();
+    await route.fulfill({contentType: types[file], body: await readFile(new URL(`../../dist/${file}`, import.meta.url)), headers: {'access-control-allow-origin': '*'}});
+  });
+  await page.goto('https://attacker.com/__guild-fixture');
+  const readyFired = await page.evaluate(async ({guildKey, siteUrl}) => {
+    const channel = 'b5be8af2-2e86-4208-b488-c7c9f1b84512';
+    window.messages = [];
+    const frame = document.createElement('iframe');
+    frame.title = 'workspace'; frame.setAttribute('sandbox', 'allow-scripts');
+    window.addEventListener('message', event => {if (event.source === frame.contentWindow && event.origin === 'null') window.messages.push(event.data);});
+
+    const ready = new Promise(resolve => {
+      frame.onload = () => {
+        frame.contentWindow.postMessage({protocol: 'freedom.guild-launchpad/v1', type: 'init', channel, guildKey, theme: 'light', actions: ['work', 'skills', 'tools', 'information']}, '*');
+        setTimeout(resolve, 500);
+      };
+    });
+    frame.src = siteUrl; document.querySelector('main').append(frame);
+    await ready;
+    return window.messages.some(message => message?.type === 'ready');
+  }, {guildKey: workspace.guild_key, siteUrl});
+  expect(readyFired).toBe(false);
+});
+
+test('sandbox bridge rejects invalid init messages', async ({page}) => {
+  const siteUrl = `https://freetwai.github.io/${workspace.repository.split('/')[1]}/`;
+  await page.route('https://freetwai.com/__guild-fixture', route => route.fulfill({contentType: 'text/html', body: '<!doctype html><html><body><main></main></body></html>'}));
+  await page.route(`${siteUrl}**`, async route => {
+    const file = route.request().url().slice(siteUrl.length) || 'index.html';
+    const types = {'index.html': 'text/html', 'site.js': 'text/javascript', 'style.css': 'text/css', 'brand.png': 'image/png'};
+    if (!Object.hasOwn(types, file)) return route.abort();
+    await route.fulfill({contentType: types[file], body: await readFile(new URL(`../../dist/${file}`, import.meta.url)), headers: {'access-control-allow-origin': '*'}});
+  });
+  await page.goto('https://freetwai.com/__guild-fixture');
+  const results = await page.evaluate(async ({guildKey, siteUrl}) => {
+    const frame = document.createElement('iframe');
+    frame.title = 'workspace'; frame.setAttribute('sandbox', 'allow-scripts');
+    document.querySelector('main').append(frame);
+    frame.src = siteUrl;
+    await new Promise(resolve => { frame.onload = resolve; });
+
+    const sendAndCheck = async (payload) => {
+      window.messages = [];
+      const listener = event => {if (event.source === frame.contentWindow && event.origin === 'null') window.messages.push(event.data);};
+      window.addEventListener('message', listener);
+      frame.contentWindow.postMessage(payload, '*');
+      await new Promise(resolve => setTimeout(resolve, 200));
+      window.removeEventListener('message', listener);
+      return window.messages.some(message => message?.type === 'ready');
+    };
+
+    const channel = 'b5be8af2-2e86-4208-b488-c7c9f1b84512';
+    const valid = {protocol: 'freedom.guild-launchpad/v1', type: 'init', channel, guildKey, theme: 'light', actions: ['work', 'skills', 'tools', 'information']};
+
+    const tests = [];
+    const payload1 = {...valid}; delete payload1.channel;
+    tests.push(await sendAndCheck(payload1));
+    tests.push(await sendAndCheck({...valid, channel: 'invalid'}));
+    tests.push(await sendAndCheck({...valid, extra: 'field'}));
+    tests.push(await sendAndCheck({...valid, theme: 'dark'}));
+    tests.push(await sendAndCheck({...valid, protocol: 'freedom.other/v1'}));
+
+    return tests;
+  }, {guildKey: workspace.guild_key, siteUrl});
+  expect(results).toEqual([false, false, false, false, false]);
+});
